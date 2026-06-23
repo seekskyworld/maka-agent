@@ -2,11 +2,27 @@ import type { MakaTool, ToolAvailabilityConfig } from '@maka/runtime';
 import {
   buildSubagentProjectionTools,
   buildSubagentSpawnTool,
+  KeyedMutex,
 } from '@maka/runtime';
 import { posix as pathPosix } from 'node:path';
 import { z } from 'zod';
 import type { IsolatedToolExecutor } from './isolation.js';
 
+// Serialize file-mutating tools per (workspace, path): the AI SDK runs a step's
+// tool calls concurrently, so two Edits to one file would race on the
+// read-modify-write (whether routed through executor.editFile or EDIT_SCRIPT's
+// read+temp+rename) and lose an update. Keyed by cwd + path so different
+// workspaces and different files stay parallel. The path is lexically normalized
+// so spellings of one file ("a.txt", "./a.txt", "d//a.txt") share a key; the key
+// is JSON.stringify of the pair so no path character can pose as the separator.
+// Keying is lexical: aliases of one file addressed under different names via a
+// symlinked parent dir or a hard link take different keys — a known limitation
+// matching the builtin path and opencode's lexical (path.resolve) Semaphore key.
+// (The executor boundary also hides the filesystem here, which may be remote.)
+// (Bash is also not serialized — a per-file lock cannot key arbitrary shell.)
+const fileWriteMutex = new KeyedMutex();
+const fileWriteKey = (cwd: string, normalizedPath: string) =>
+  JSON.stringify([pathPosix.normalize(cwd), pathPosix.normalize(normalizedPath)]);
 /**
  * Build Maka's standard headless tool surface with shell and file operations
  * routed through the isolated executor boundary.
@@ -96,12 +112,14 @@ export function buildIsolatedWriteTool(executor: IsolatedToolExecutor): MakaTool
     permissionRequired: true,
     impl: async ({ path, content }, { cwd }) => {
       const normalizedPath = normalizeWorkspacePath(path, cwd, 'Write path');
-      if (executor.writeFile) return await executor.writeFile({ cwd, path: normalizedPath, content });
-      await execFileCommand(executor, cwd, shellFileCommand(WRITE_SCRIPT, [
-        normalizedPath,
-        content,
-      ]));
-      return { ok: true, path: normalizedPath, bytes: Buffer.byteLength(content, 'utf8') };
+      return await fileWriteMutex.runExclusive(fileWriteKey(cwd, normalizedPath), async () => {
+        if (executor.writeFile) return await executor.writeFile({ cwd, path: normalizedPath, content });
+        await execFileCommand(executor, cwd, shellFileCommand(WRITE_SCRIPT, [
+          normalizedPath,
+          content,
+        ]));
+        return { ok: true, path: normalizedPath, bytes: Buffer.byteLength(content, 'utf8') };
+      });
     },
   };
 }
@@ -118,15 +136,17 @@ export function buildIsolatedEditTool(executor: IsolatedToolExecutor): MakaTool 
     permissionRequired: true,
     impl: async ({ path, old_string, new_string }, { cwd }) => {
       const normalizedPath = normalizeWorkspacePath(path, cwd, 'Edit path');
-      if (executor.editFile) {
-        return await executor.editFile({ cwd, path: normalizedPath, oldString: old_string, newString: new_string });
-      }
-      await execFileCommand(executor, cwd, shellFileCommand(EDIT_SCRIPT, [
-        normalizedPath,
-        old_string,
-        new_string,
-      ]));
-      return { ok: true, path: normalizedPath, replacements: 1 };
+      return await fileWriteMutex.runExclusive(fileWriteKey(cwd, normalizedPath), async () => {
+        if (executor.editFile) {
+          return await executor.editFile({ cwd, path: normalizedPath, oldString: old_string, newString: new_string });
+        }
+        await execFileCommand(executor, cwd, shellFileCommand(EDIT_SCRIPT, [
+          normalizedPath,
+          old_string,
+          new_string,
+        ]));
+        return { ok: true, path: normalizedPath, replacements: 1 };
+      });
     },
   };
 }

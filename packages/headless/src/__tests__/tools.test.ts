@@ -188,6 +188,46 @@ describe('isolated headless tools', () => {
     assert.ok(calls.every((command) => !command.includes('node -e')));
   });
 
+  test('concurrent Edits to the same file serialize — no lost update', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'maka-headless-tools-lock-'));
+    const file = join(cwd, 'data.txt');
+    const n = 20;
+    const markers = Array.from({ length: n }, (_, i) => `marker-${String(i).padStart(2, '0')}`);
+    await writeFile(file, `${markers.join('\n')}\n`, 'utf8');
+    // No executor.editFile -> EDIT_SCRIPT (read whole file -> temp -> rename). Run
+    // through the real shell so the read-modify-write actually hits disk.
+    const tools = execBackedTools();
+    // Fire all edits concurrently. Each rewrites the whole file, so without the
+    // per-path lock the last rename would clobber the others and most edits vanish.
+    const results = await Promise.all(markers.map((m, i) =>
+      tool(tools, 'Edit').impl({ path: file, old_string: m, new_string: `done-${String(i).padStart(2, '0')}` }, toolCtx(cwd)),
+    ));
+    assert.ok(results.every((r: any) => r.ok === true && r.replacements === 1));
+    const expected = `${Array.from({ length: n }, (_, i) => `done-${String(i).padStart(2, '0')}`).join('\n')}\n`;
+    assert.equal(await readFile(file, 'utf8'), expected, 'every concurrent edit landed');
+  });
+
+  test('concurrent Edits via different path spellings serialize on one key', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'maka-headless-tools-lockkey-'));
+    const file = join(cwd, 'data.txt');
+    const n = 20;
+    const markers = Array.from({ length: n }, (_, i) => `marker-${String(i).padStart(2, '0')}`);
+    await writeFile(file, `${markers.join('\n')}\n`, 'utf8');
+    const tools = execBackedTools();
+    // Alternate the spelling of the same file. Without lexical key normalization
+    // 'data.txt' and './data.txt' hash to different mutex keys, so the two groups
+    // run concurrently and clobber each other; normalization collapses them.
+    const results = await Promise.all(markers.map((m, i) =>
+      tool(tools, 'Edit').impl(
+        { path: i % 2 === 0 ? 'data.txt' : './data.txt', old_string: m, new_string: `done-${String(i).padStart(2, '0')}` },
+        toolCtx(cwd),
+      ),
+    ));
+    assert.ok(results.every((r: any) => r.ok === true));
+    const expected = `${Array.from({ length: n }, (_, i) => `done-${String(i).padStart(2, '0')}`).join('\n')}\n`;
+    assert.equal(await readFile(file, 'utf8'), expected, 'every edit landed despite mixed path spellings');
+  });
+
   test('command-backed file tools do not follow symlinks outside the isolated workspace', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'maka-headless-tools-symlink-'));
     const outside = await mkdtemp(join(tmpdir(), 'maka-headless-tools-outside-'));
@@ -299,6 +339,23 @@ describe('isolated headless tools', () => {
     );
   });
 });
+
+function execBackedTools(env: NodeJS.ProcessEnv = process.env) {
+  return buildIsolatedHeadlessTools({
+    async exec(input) {
+      try {
+        const { stdout, stderr } = await execAsync(input.command, { cwd: input.cwd, env, maxBuffer: 1024 * 1024 });
+        return { exitCode: 0, stdout, stderr };
+      } catch (error: any) {
+        return {
+          exitCode: typeof error?.code === 'number' ? error.code : 1,
+          stdout: typeof error?.stdout === 'string' ? error.stdout : '',
+          stderr: typeof error?.stderr === 'string' ? error.stderr : String(error),
+        };
+      }
+    },
+  });
+}
 
 function tool(tools: ReturnType<typeof buildIsolatedHeadlessTools>, name: string) {
   const found = tools.find((candidate) => candidate.name === name);

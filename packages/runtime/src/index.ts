@@ -211,6 +211,7 @@ export {
 export type { ToolActivityItem, ChatItem, SessionViewModel } from './materializer.js';
 
 export { AsyncEventQueue } from './async-queue.js';
+export { KeyedMutex } from './keyed-mutex.js';
 export { FakeBackend } from './fake-backend.js';
 
 export {

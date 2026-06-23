@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect } from '../test-helpers.js';
-import { buildBuiltinTools } from '../builtin-tools.js';
+import { buildBuiltinTools, fileWriteLockKey } from '../builtin-tools.js';
 
 describe('builtin Bash streaming output', () => {
   test('emits stdout/stderr chunks before returning terminal result', async () => {
@@ -136,6 +136,40 @@ describe('builtin write tools path containment', () => {
 
     await runTool(edit, { path: 'inside.txt', old_string: 'world', new_string: 'Maka' }, root);
     expect(await readFile(join(root, 'inside.txt'), 'utf8')).toBe('hello Maka');
+  });
+
+  test('concurrent Edits to the same file serialize — no lost update', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'maka-edit-lock-'));
+    const n = 20;
+    const markers = Array.from({ length: n }, (_, i) => `marker-${String(i).padStart(2, '0')}`);
+    await writeFile(join(root, 'data.txt'), `${markers.join('\n')}\n`, 'utf8');
+    const edit = tool('Edit');
+    // Each Edit is a read-modify-write (fs.readFile -> replace -> fs.writeFile).
+    // Fired concurrently without the per-path lock, the writes clobber each other
+    // and most edits are lost; the lock serializes them so every one lands.
+    const results = await Promise.all(markers.map((m, i) =>
+      runTool(edit, { path: 'data.txt', old_string: m, new_string: `done-${String(i).padStart(2, '0')}` }, root),
+    ));
+    expect(results.every((r) => (r as { ok: boolean; replacements: number }).ok === true
+      && (r as { replacements: number }).replacements === 1)).toBe(true);
+    const expected = `${Array.from({ length: n }, (_, i) => `done-${String(i).padStart(2, '0')}`).join('\n')}\n`;
+    expect(await readFile(join(root, 'data.txt'), 'utf8')).toBe(expected);
+  });
+
+  test('lock key is the stable lexical path: spellings collapse, creation never splits it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'maka-edit-key-'));
+    const key = await fileWriteLockKey(root, 'dir/f.txt');
+    // Different spellings of one file share a key.
+    expect(await fileWriteLockKey(root, './dir/f.txt')).toBe(key);
+    expect(await fileWriteLockKey(root, 'dir//f.txt')).toBe(key);
+    expect(key.endsWith(join('dir', 'f.txt'))).toBe(true); // native separator, portable
+    // A different file gets a different key.
+    expect(await fileWriteLockKey(root, 'g.txt') === key).toBe(false);
+    // Purely lexical (no stat), so the key is identical before and after the file
+    // exists — a file's creation cannot move it to a second lock key mid-flight.
+    const before = await fileWriteLockKey(root, 'new.txt');
+    await writeFile(join(root, 'new.txt'), 'x', 'utf8');
+    expect(await fileWriteLockKey(root, 'new.txt')).toBe(before);
   });
 });
 

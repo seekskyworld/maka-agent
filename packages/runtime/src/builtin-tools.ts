@@ -17,9 +17,29 @@ import { dirname, isAbsolute, relative, resolve } from 'node:path';
 // builtin-tools directly.
 import type { MakaTool, MakaToolContext } from './ai-sdk-backend.js';
 export type { MakaTool, MakaToolContext };
+import { KeyedMutex } from './keyed-mutex.js';
 
 const execAsync = promisify(exec);
 const BASH_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+
+// Serialize file-mutating tools per file: the AI SDK runs a step's tool calls
+// concurrently, so two Edits (read-modify-write) to one file would otherwise
+// race and lose an update. Writes to different files stay parallel.
+// (Bash is intentionally not serialized — a per-file lock cannot key arbitrary
+// shell; this matches opencode's per-file Semaphore, which also leaves shell
+// uncoordinated.)
+const fileWriteMutex = new KeyedMutex();
+
+// Key on the lexically resolved absolute path, derived identically for Write and
+// Edit so both lock the same file and spellings ("a", "./a", "d//a") collapse.
+// It is purely lexical (no stat/realpath), so the key is stable across a file's
+// creation and never splits one file across two keys mid-flight. Aliases of one
+// file addressed under different names via a final symlink or hard link are not
+// merged — a known limitation matching opencode's lexical (path.resolve)
+// Semaphore key. Exported for a deterministic unit test.
+export async function fileWriteLockKey(cwd: string, inputPath: string): Promise<string> {
+  return resolve(await fs.realpath(cwd), inputPath);
+}
 
 export function buildBuiltinTools(): MakaTool[] {
   return [
@@ -74,8 +94,10 @@ export function buildBuiltinTools(): MakaTool[] {
       permissionRequired: true,
       impl: async ({ path, content }, { cwd }) => {
         const abs = await resolveWritableInsideCwd(cwd, path, 'Write');
-        await fs.writeFile(abs, content, 'utf8');
-        return { ok: true, path: abs, bytes: Buffer.byteLength(content, 'utf8') };
+        return await fileWriteMutex.runExclusive(await fileWriteLockKey(cwd, path), async () => {
+          await fs.writeFile(abs, content, 'utf8');
+          return { ok: true, path: abs, bytes: Buffer.byteLength(content, 'utf8') };
+        });
       },
     },
     {
@@ -90,15 +112,17 @@ export function buildBuiltinTools(): MakaTool[] {
       permissionRequired: true,
       impl: async ({ path, old_string, new_string }, { cwd }) => {
         const abs = await resolveExistingInsideCwd(cwd, path, 'Edit');
-        const current = await fs.readFile(abs, 'utf8');
-        const count = current.split(old_string).length - 1;
-        if (count === 0) throw new Error(`old_string not found in ${path}`);
-        if (count > 1) {
-          throw new Error(`old_string is not unique in ${path} (${count} matches)`);
-        }
-        const next = current.replace(old_string, new_string);
-        await fs.writeFile(abs, next, 'utf8');
-        return { ok: true, path: abs, replacements: 1 };
+        return await fileWriteMutex.runExclusive(await fileWriteLockKey(cwd, path), async () => {
+          const current = await fs.readFile(abs, 'utf8');
+          const count = current.split(old_string).length - 1;
+          if (count === 0) throw new Error(`old_string not found in ${path}`);
+          if (count > 1) {
+            throw new Error(`old_string is not unique in ${path} (${count} matches)`);
+          }
+          const next = current.replace(old_string, new_string);
+          await fs.writeFile(abs, next, 'utf8');
+          return { ok: true, path: abs, replacements: 1 };
+        });
       },
     },
     {
