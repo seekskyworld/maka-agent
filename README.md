@@ -11,3 +11,5 @@ Automated evidence prepared by OpenAI Codex for https://github.com/apache/maka/i
 
 
 Review follow-up (2026-09-16): current production builder now reads settings navigation labels directly. Chrome queries `遠端串接`, `聯網搜尋`, `側聊`, and `追問` return the corresponding commands. `after-settings.png` has been refreshed and the three targeted search screenshots plus `review-browser.json` record the results. The existing Storybook fixture was temporarily populated from the real builder and restored after capture. Generated-by: OpenAI Codex.
+
+2026-09-17 review follow-up: before/after paste-review screenshots use the production builder and palette with zh-TW. The paste target changes from `composer` to `輸入框`. Both Chrome captures had no page errors; temporary story and catalog substitutions were restored. Generated-by: OpenAI Codex.
